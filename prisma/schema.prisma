@@ -1,0 +1,354 @@
+// ============================================================================
+// Copia sincronizada del esquema canónico de Paula.
+// FUENTE DE VERDAD: paula-portal/libs/db/prisma/schema.prisma
+// El bot usa esta copia solo para generar su cliente Prisma; NO ejecuta
+// migraciones (las migraciones viven en el portal). Ambos apuntan a la misma
+// base de datos PostgreSQL 'paula'.
+// Si cambias el esquema, edítalo primero en el portal y copia aquí.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enumeraciones de dominio
+// ----------------------------------------------------------------------------
+
+enum Channel {
+  WHATSAPP
+}
+
+enum ConversationMode {
+  AUTOMATIC
+  AGENT
+  MANUAL
+}
+
+enum ConversationStatus {
+  CREATED
+  ACTIVE
+  PENDING_TIMEOUT
+  CLOSED
+  ERROR
+}
+
+enum CloseReason {
+  USER_FINISHED
+  AGENT_FINISHED
+  TIMEOUT
+  MANUAL
+  SYSTEM_ERROR
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+  INTERNAL
+}
+
+enum MessageRole {
+  user
+  assistant
+  advisor
+  system
+  tool
+}
+
+enum MessageType {
+  text
+  image
+  document
+  system_event
+  internal_note
+  tool_call
+}
+
+enum MessageVisibility {
+  PUBLIC
+  INTERNAL
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum UserRole {
+  PAULA_ADVISOR
+  PAULA_SUPERVISOR
+  PAULA_ADMIN
+}
+
+enum AuditActorType {
+  USER
+  AGENT
+  BOT
+  SYSTEM
+}
+
+enum AuditSource {
+  WEB
+  BOT
+  AGENT
+  WATCHDOG
+}
+
+enum OutboundStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+}
+
+// ----------------------------------------------------------------------------
+// Contactos (identidad del canal). Tabla 3 del data-model.
+// ----------------------------------------------------------------------------
+model Contact {
+  contactId            String    @id @map("contact_id")
+  schemaVersion        Int       @default(1) @map("schema_version")
+  channel              Channel   @default(WHATSAPP)
+  phoneE164            String    @unique @map("phone_e164")
+  displayName          String?   @map("display_name")
+  providerProfileName  String?   @map("provider_profile_name")
+  preferredLanguage    String?   @default("es") @map("preferred_language")
+  lastSessionId        String?   @map("last_session_id")
+  lastSeenAt           DateTime? @map("last_seen_at")
+  version              Int       @default(1)
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  sessions Session[]
+
+  @@map("contacts")
+}
+
+// ----------------------------------------------------------------------------
+// Usuarios del portal.
+// ----------------------------------------------------------------------------
+model User {
+  id           String   @id
+  email        String   @unique
+  name         String
+  role         UserRole @default(PAULA_ADVISOR)
+  passwordHash String?  @map("password_hash")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  assignedSessions Session[]        @relation("AssignedAdvisor")
+  readStates       UserReadState[]
+
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// Sesiones (estado de la conversación). Tabla 1 del data-model.
+// ----------------------------------------------------------------------------
+model Session {
+  sessionId          String             @id @map("session_id")
+  schemaVersion      Int                @default(1) @map("schema_version")
+  channel            Channel            @default(WHATSAPP)
+
+  contactId          String             @map("contact_id")
+  phoneE164          String             @map("phone_e164")
+
+  thirdPartyId       String?            @map("third_party_id")
+  thirdPartyName     String?            @map("third_party_name")
+
+  flow               String?            @default("MENU")
+  mode               ConversationMode   @default(AUTOMATIC)
+  status             ConversationStatus @default(CREATED)
+
+  assignedTo         String?            @map("assigned_to")
+  assignedToName     String?            @map("assigned_to_name")
+  assignmentKey      String             @default("UNASSIGNED") @map("assignment_key")
+
+  lastMessageAt        DateTime?        @map("last_message_at")
+  lastUserActivityAt   DateTime?        @map("last_user_activity_at")
+  lastMessagePreview   String?          @map("last_message_preview")
+  lastMessageDirection MessageDirection? @map("last_message_direction")
+
+  warningSentAt      DateTime?          @map("warning_sent_at")
+  closedAt           DateTime?          @map("closed_at")
+  closeReason        CloseReason?       @map("close_reason")
+
+  messageCount       Int                @default(0) @map("message_count")
+
+  conversationSummary String?           @map("conversation_summary")
+  summaryUntilKey     String?           @map("summary_until_key")
+  contextVersion      Int               @default(1) @map("context_version")
+
+  version            Int                @default(1)
+
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  contact       Contact         @relation(fields: [contactId], references: [contactId])
+  advisor       User?           @relation("AssignedAdvisor", fields: [assignedTo], references: [id])
+  messages      Message[]
+  auditEvents   AuditEvent[]
+  readStates    UserReadState[]
+  outbound      OutboundMessage[]
+
+  @@index([phoneE164, createdAt])
+  @@index([assignmentKey, lastMessageAt])
+  @@index([status, lastUserActivityAt])
+  @@index([thirdPartyId, createdAt])
+  @@map("sessions")
+}
+
+// ----------------------------------------------------------------------------
+// Mensajes (histórico conversacional). Tabla 2 del data-model.
+// ----------------------------------------------------------------------------
+model Message {
+  messageId          String            @id @map("message_id")
+  sessionId          String            @map("session_id")
+  schemaVersion      Int               @default(1) @map("schema_version")
+
+  externalMessageId  String?           @map("external_message_id")
+  clientMessageId    String?           @map("client_message_id")
+
+  role               MessageRole
+  direction          MessageDirection
+  type               MessageType       @default(text)
+  visibility         MessageVisibility @default(PUBLIC)
+
+  content            String?
+  attachments        Json?
+
+  authorId           String?           @map("author_id")
+  authorName         String?           @map("author_name")
+  replyToMessageId   String?           @map("reply_to_message_id")
+
+  deliveryStatus     DeliveryStatus?   @map("delivery_status")
+  deliveryErrorCode  String?           @map("delivery_error_code")
+
+  toolName           String?           @map("tool_name")
+  toolCallId         String?           @map("tool_call_id")
+  toolStatus         String?           @map("tool_status")
+  toolParameters     Json?             @map("tool_parameters_redacted")
+
+  providerTimestamp  DateTime?         @map("provider_timestamp")
+  correlationId      String?           @map("correlation_id")
+  createdAt          DateTime          @default(now()) @map("created_at")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@index([externalMessageId])
+  @@index([clientMessageId])
+  @@map("messages")
+}
+
+// ----------------------------------------------------------------------------
+// Auditoría de dominio. Tabla 4 del data-model.
+// ----------------------------------------------------------------------------
+model AuditEvent {
+  eventId       String         @id @map("event_id")
+  sessionId     String         @map("session_id")
+  schemaVersion Int            @default(1) @map("schema_version")
+
+  eventType     String         @map("event_type")
+  actorType     AuditActorType @map("actor_type")
+  actorId       String?        @map("actor_id")
+  actorName     String?        @map("actor_name")
+
+  entityType    String         @map("entity_type")
+  entityId      String?        @map("entity_id")
+
+  previousValue Json?          @map("previous_value")
+  newValue      Json?          @map("new_value")
+  reason        String?
+
+  commandId     String?        @map("command_id")
+  correlationId String?        @map("correlation_id")
+  source        AuditSource
+
+  createdAt     DateTime       @default(now()) @map("created_at")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("audit_events")
+}
+
+// ----------------------------------------------------------------------------
+// Estado de lectura del portal. Tabla 5 del data-model.
+// ----------------------------------------------------------------------------
+model UserReadState {
+  userId                  String   @map("user_id")
+  sessionId               String   @map("session_id")
+  schemaVersion           Int      @default(1) @map("schema_version")
+  lastReadMessageId       String?  @map("last_read_message_id")
+  lastReadAt              DateTime? @map("last_read_at")
+  unreadCount             Int      @default(0) @map("unread_count")
+  lastSeenSessionVersion  Int?     @map("last_seen_session_version")
+  createdAt               DateTime @default(now()) @map("created_at")
+  updatedAt               DateTime @updatedAt @map("updated_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@id([userId, sessionId])
+  @@map("user_read_state")
+}
+
+// ----------------------------------------------------------------------------
+// Idempotencia. Tabla 6 del data-model.
+// ----------------------------------------------------------------------------
+model IdempotencyKey {
+  idempotencyKey String   @id @map("idempotency_key")
+  schemaVersion  Int      @default(1) @map("schema_version")
+  scope          String
+  status         String   @default("PROCESSING")
+  sessionId      String?  @map("session_id")
+  entityId       String?  @map("entity_id")
+  requestHash    String?  @map("request_hash")
+  responseRef    Json?    @map("response_ref")
+  correlationId  String?  @map("correlation_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+  expiresAt      DateTime? @map("expires_at")
+
+  @@map("idempotency")
+}
+
+// ----------------------------------------------------------------------------
+// Cola de salida: portal -> bot.
+// ----------------------------------------------------------------------------
+model OutboundMessage {
+  id              String         @id @default(uuid())
+  sessionId       String         @map("session_id")
+  phoneE164       String         @map("phone_e164")
+
+  messageId       String?        @map("message_id")
+  clientMessageId String?        @map("client_message_id")
+
+  kind            String         @default("text")
+  content         String?
+  mediaUrl        String?        @map("media_url")
+  filename        String?
+
+  status          OutboundStatus @default(PENDING)
+  attempts        Int            @default(0)
+  lastError       String?        @map("last_error")
+
+  enqueuedBy      String?        @map("enqueued_by")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  sentAt          DateTime?      @map("sent_at")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@map("outbound_messages")
+}

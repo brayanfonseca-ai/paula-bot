@@ -6,7 +6,10 @@
       "**/*.spec.ts"
   ],
     "delay": "3",
+    "env": {
+      "NODE_EXTRA_CA_CERTS": "./certs/acronis-ca.pem"
+    },
     "execMap": {
-      "ts": "tsx"
+      "ts": "tsx --env-file=.env"
     }
   }

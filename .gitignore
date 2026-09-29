@@ -9,3 +9,6 @@ node_modules
 *.log
 *qr.png
 logs/
+
+# Certificado local de inspección SSL (Acronis/proxy). Es específico de cada máquina.
+certs/

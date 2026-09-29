@@ -1,10 +1,34 @@
+// IMPORTANTE: debe ir de PRIMERO, antes de cualquier cliente HTTP (provider Meta).
+import './tls-setup'
 import { join } from 'path'
 import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
 import { MemoryDB as Database } from '@builderbot/bot'
 import { MetaProvider as Provider } from '@builderbot/provider-meta'
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs'
+import * as repo from './repository'
+import { prisma } from './db'
+import { iniciarWorkerSalientes } from './outbound-worker'
 
 const PORT = process.env.PORT ?? 3008
+
+// ============================================================================
+// CREDENCIALES DE META (desde variables de entorno / archivo .env)
+// ----------------------------------------------------------------------------
+// Se cargan con `node --env-file=.env` (ver scripts en package.json y
+// nodemon.json). No se hardcodean en el código para no exponerlas en git.
+// ============================================================================
+const META_JWT_TOKEN = process.env.META_JWT_TOKEN ?? ''
+const META_NUMBER_ID = process.env.META_NUMBER_ID ?? ''
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN ?? ''
+const META_VERSION = process.env.META_VERSION ?? 'v25.0'
+
+if (!META_JWT_TOKEN || !META_NUMBER_ID || !META_VERIFY_TOKEN) {
+    console.error(
+        '🟠 Faltan credenciales de Meta. Copia .env.example a .env y completa ' +
+        'META_JWT_TOKEN, META_NUMBER_ID y META_VERIFY_TOKEN.',
+    )
+    process.exit(1)
+}
 
 // ============================================================================
 // CONFIGURACIÓN (replicada del proyecto Python paula_whatsapp/sam-app)
@@ -69,14 +93,29 @@ interface EventoTraza {
     detalle?: Record<string, unknown>
 }
 
-// Punto único de persistencia. Hoy imprime por consola; mañana escribe en BD.
+// Punto único de persistencia. Escribe la traza a consola, archivo y a la
+// tabla audit_events de PostgreSQL (para el portal y el monitoreo en tiempo real).
 const persistirTraza = (evento: EventoTraza) => {
-    // TODO(BD): reemplazar por INSERT/stream a la base de datos de monitoreo.
     console.log('TRACE', JSON.stringify(evento))
     try {
         mkdirSync(LOG_DIR, { recursive: true })
         appendFileSync(join(LOG_DIR, 'traza.log'), JSON.stringify(evento) + '\n')
     } catch { /* noop */ }
+
+    // Persistencia en BD (fire-and-forget): solo si ya hay una sesión asociada
+    // al número; no forzamos crearla desde una traza para no generar sesiones
+    // vacías por saludos que no autentican.
+    const sessionId = SESIONES.get(evento.numero)?.sessionId
+    if (sessionId) {
+        void repo.registrarEvento({
+            sessionId,
+            eventType: `${evento.etapa}.${evento.paso}`.toUpperCase(),
+            actorType: 'BOT',
+            entityType: 'SESSION',
+            entityId: sessionId,
+            newValue: evento.detalle,
+        })
+    }
 }
 
 // Helper para emitir un evento de traza de forma concisa.
@@ -106,12 +145,40 @@ interface Sesion {
     tipoRetencion?: 'ICA' | 'FUENTE'
     retencionYear?: number
     procesando?: boolean
+    // Id de la sesión persistida en PostgreSQL (une el estado en memoria con la BD).
+    sessionId?: string
 }
+// Caché de trabajo del flujo conversacional (menú/selección transitoria). La
+// fuente de verdad para el portal es PostgreSQL; este Map solo acelera el
+// enrutamiento en curso y guarda el sessionId de BD asociado al número.
 const SESIONES = new Map<string, Sesion>()
 
 const getSesion = (numero: string): Sesion => {
     if (!SESIONES.has(numero)) SESIONES.set(numero, {})
     return SESIONES.get(numero) as Sesion
+}
+
+/** Devuelve el sessionId de BD del número (garantizando sesión abierta). */
+const getSessionId = async (numero: string): Promise<string> => {
+    const mem = getSesion(numero)
+    if (mem.sessionId) return mem.sessionId
+    const { sesion } = await repo.obtenerOCrearSesion(numero)
+    mem.sessionId = sesion.sessionId
+    return sesion.sessionId
+}
+
+/** Cierra la sesión en BD y limpia el estado en memoria del número. */
+const finalizarSesion = async (
+    numero: string,
+    motivo: 'USER_FINISHED' | 'AGENT_FINISHED' | 'TIMEOUT' | 'MANUAL' | 'SYSTEM_ERROR',
+): Promise<void> => {
+    try {
+        const sessionId = SESIONES.get(numero)?.sessionId
+        if (sessionId) await repo.cerrarSesion(sessionId, motivo)
+    } catch (err) {
+        log('[db] Error cerrando sesión:', String(err))
+    }
+    SESIONES.delete(numero)
 }
 
 // ============================================================================
@@ -178,6 +245,9 @@ const errDetalle = (err: any): string => {
 const enviarTexto = async (numero: string, mensaje: string) => {
     try {
         await PROVIDER.sendText(numero, mensaje)
+        // Persiste el saliente del bot en el histórico (fire-and-forget).
+        const sessionId = SESIONES.get(numero)?.sessionId
+        if (sessionId) void repo.guardarMensajeSalienteBot(sessionId, mensaje)
     } catch (err) {
         log('[wa] Error sendText:', errDetalle(err))
     }
@@ -725,7 +795,7 @@ const procesarInteractivo = async (numero: string, opcionRaw: string) => {
     if (opcion === 'otra_no') {
         trace(numero, 'salida', 'finalizar')
         await enviarTexto(numero, '¡Gracias por usar nuestros servicios! �\nQue tengas un excelente día. 👋')
-        SESIONES.delete(numero)
+        await finalizarSesion(numero, 'USER_FINISHED')
         return
     }
     if (opcion === 'volver_menu') {
@@ -735,6 +805,21 @@ const procesarInteractivo = async (numero: string, opcionRaw: string) => {
     }
     if (opcion === 'agente' || opcion === 'menu_4') {
         trace(numero, 'agente', 'derivar_asesor')
+        // Handoff (RF-019): la sesión pasa a MANUAL. El bot deja de responder
+        // automáticamente y la conversación queda visible/atendible en el portal.
+        try {
+            const sessionId = await getSessionId(numero)
+            await repo.actualizarSesion(sessionId, { mode: 'MANUAL' })
+            await repo.registrarEvento({
+                sessionId,
+                eventType: 'HANDOFF_REQUESTED',
+                actorType: 'BOT',
+                entityType: 'SESSION',
+                entityId: sessionId,
+            })
+        } catch (err) {
+            log('[db] Error en handoff a manual:', String(err))
+        }
         await enviarTexto(
             numero,
             '👤 En seguida te comunico con uno de nuestros asesores. Por favor, espera un momento mientras uno de ellos retoma tu conversación.',
@@ -745,7 +830,7 @@ const procesarInteractivo = async (numero: string, opcionRaw: string) => {
     if (opcion === 'salir') {
         trace(numero, 'salida', 'salir')
         await enviarTexto(numero, '¡Gracias por comunicarte con nosotros! 👋')
-        SESIONES.delete(numero)
+        await finalizarSesion(numero, 'USER_FINISHED')
         return
     }
 
@@ -827,11 +912,42 @@ const mainFlow = addKeyword<Provider, Database>(EVENTS.WELCOME)
         if (!SESIONES.has(numero)) {
             if (tipo === 'text' || tipo === '') {
                 if (bodyRaw.toLowerCase() === 'hola') {
+                    // Persistencia en BD: NO debe bloquear la respuesta al usuario.
+                    // Si la BD falla, se registra y se continúa con el flujo normal.
+                    try {
+                        const sessionId = await getSessionId(numero)
+                        await repo.guardarMensajeEntrante(sessionId, bodyRaw)
+                    } catch (err) {
+                        log('[db] Error persistiendo saludo (se continúa):', String(err))
+                    }
                     trace(numero, 'sesion', 'saludo_inicial', { texto: bodyRaw })
                     await validarUsuario(numero)
                 }
             }
             return
+        }
+
+        // Persiste el mensaje entrante del usuario en el histórico (RF-006) y
+        // marca actividad del usuario (RF-007) para la sesión ya existente.
+        try {
+            const sessionId = await getSessionId(numero)
+            await repo.guardarMensajeEntrante(sessionId, bodyRaw)
+            await repo.marcarActividadUsuario(sessionId)
+
+            // MODO MANUAL (RF-008/RF-019): si un asesor tomó la conversación
+            // desde el portal, el bot NO responde automáticamente. Solo guarda
+            // el mensaje para que el asesor lo vea; él responde vía la cola de
+            // salida (outbound_messages).
+            const sesionBd = await prisma.session.findUnique({
+                where: { sessionId },
+                select: { mode: true },
+            })
+            if (sesionBd?.mode === 'MANUAL') {
+                trace(numero, 'sesion', 'mensaje_en_modo_manual', { texto: bodyRaw })
+                return
+            }
+        } catch (err) {
+            log('[db] Error persistiendo entrante:', String(err))
         }
 
         // SESIÓN EXISTENTE:
@@ -855,16 +971,54 @@ const mainFlow = addKeyword<Provider, Database>(EVENTS.WELCOME)
     })
 
 // ============================================================================
+// CHEQUEO DE SALUD DEL TOKEN DE META
+// ----------------------------------------------------------------------------
+// Verifica al arrancar que el token de WhatsApp es válido. Si expiró (los
+// tokens temporales duran ~24h), el bot procesaría los mensajes pero NO podría
+// responder (Meta devuelve 403 #131005). Este chequeo lo hace visible de una.
+// ============================================================================
+const verificarTokenMeta = async (): Promise<void> => {
+    try {
+        // Consulta el estado del número: distingue número de PRUEBA vs real, que
+        // es la causa típica de "recibe pero no responde" (los números de prueba
+        // solo escriben a destinatarios previamente autorizados en el panel).
+        const url = `https://graph.facebook.com/${META_VERSION}/${META_NUMBER_ID}?fields=display_phone_number,verified_name,platform_type&access_token=${META_JWT_TOKEN}`
+        const res = await fetch(url)
+        if (!res.ok) {
+            const detalle = await res.text()
+            log('🟠 [meta] TOKEN/NÚMERO CON PROBLEMA (HTTP ' + res.status + '):', detalle)
+            log('🟠 [meta] Renueva META_JWT_TOKEN en .env (developers.facebook.com -> WhatsApp -> API Setup).')
+            return
+        }
+        const info = (await res.json()) as {
+            display_phone_number?: string
+            verified_name?: string
+        }
+        const esNumeroPrueba = (info.verified_name ?? '').toLowerCase().includes('test')
+        log('[meta] Número:', info.display_phone_number ?? '?', '(' + (info.verified_name ?? '?') + ')')
+        if (esNumeroPrueba) {
+            log('🟠 [meta] Estás usando un NÚMERO DE PRUEBA. Solo puedes escribir a destinatarios')
+            log('🟠 [meta] previamente autorizados en WhatsApp -> API Setup -> "To" -> Manage phone number list.')
+            log('🟠 [meta] Si un usuario no está en esa lista, el bot recibe su mensaje pero Meta devuelve 403 al responder.')
+        } else {
+            log('[meta] Token válido y número de producción. El bot puede responder a cualquier usuario.')
+        }
+    } catch (err) {
+        log('🟠 [meta] No se pudo verificar el token de Meta:', String(err))
+    }
+}
+
+// ============================================================================
 // BOOTSTRAP
 // ============================================================================
 const main = async () => {
     const adapterFlow = createFlow([mainFlow])
 
     const adapterProvider = createProvider(Provider, {
-        jwtToken: 'EAAg1ZA3jiRAkBSjZCmcevZBwDAFmt4iQoyNM9GERXvwThsvwuwlIEXWmx7C2gspnNWxaGweCBQeBe4khj6iomO8TB9ZC5ItAvzl6IOVaC1L0ZBZB21qHgwzbEpGqj79cwZBZB6XUW3Sh22OvQ6KPwx48mWqG8sehf4X6uOKKIDqMPJNUrYIZCeLZCq9ZADd0Fm2EpTJeICyoOaM6h0BUtbeNDLOE4S8fAZAZAptlkGR4hNEjQGfq4JQYKsLPhPF51eFb4yohcMy5DLegJrfpaTl9v5Nf8zgepRDZA8iezxW3oNvSQZD',
-        numberId: '1282085621652620',
-        verifyToken: 'paula2026',
-        version: 'v25.0',
+        jwtToken: META_JWT_TOKEN,
+        numberId: META_NUMBER_ID,
+        verifyToken: META_VERIFY_TOKEN,
+        version: META_VERSION,
     })
     const adapterDB = new Database()
 
@@ -877,8 +1031,23 @@ const main = async () => {
     // Exponer el provider para los routers.
     PROVIDER = adapterProvider
 
+    // Avisa de inmediato si el token de Meta está vencido (causa típica de
+    // "recibe pero no responde").
+    await verificarTokenMeta()
+
     // Reanuda la entrega de reportes que quedaron pendientes antes de un reinicio.
     await recuperarPendientes()
+
+    // Inicia el worker que envía por WhatsApp los mensajes que el portal encola
+    // (respuestas de asesores en modo MANUAL). Canal portal -> bot.
+    iniciarWorkerSalientes(
+        {
+            texto: enviarTexto,
+            imagen: enviarImagen,
+            documento: (numero, url, filename, caption) => enviarPdf(numero, url, filename, caption),
+        },
+        log,
+    )
 
     adapterProvider.server.post(
         '/v1/messages',
