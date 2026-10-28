@@ -32,11 +32,25 @@ export const iniciarWorkerSalientes = (
 ): (() => void) => {
   let activo = true
   let corriendo = false
+  // Cada cuántos ciclos revisar SENDING huérfanos (proceso caído a mitad).
+  const CICLOS_ENTRE_RECUPERACION = Math.max(1, Math.round(30000 / intervalo))
+  let ciclosDesdeRecuperacion = CICLOS_ENTRE_RECUPERACION // fuerza chequeo en el 1er ciclo
 
   const ciclo = async () => {
     if (!activo || corriendo) return
     corriendo = true
     try {
+      // Recuperación periódica de SENDING huérfanos: los devuelve a PENDING.
+      if (++ciclosDesdeRecuperacion >= CICLOS_ENTRE_RECUPERACION) {
+        ciclosDesdeRecuperacion = 0
+        try {
+          const n = await repo.recuperarSalientesHuerfanos()
+          if (n > 0) log('[outbound] recuperados', n, 'SENDING huérfanos -> PENDING')
+        } catch (err) {
+          log('[outbound] error recuperando huérfanos:', String(err))
+        }
+      }
+
       const pendientes = await repo.reclamarSalientesPendientes(10)
       for (const p of pendientes) {
         try {
@@ -48,12 +62,21 @@ export const iniciarWorkerSalientes = (
             await enviar.texto(p.phoneE164, p.content ?? '')
           }
 
-          // Persiste el mensaje del asesor en el histórico (rol advisor) si no
-          // fue ya persistido por el portal (evita duplicar por clientMessageId).
+          // Persiste el mensaje del asesor en el histórico (rol advisor) SOLO si
+          // el portal no lo persistió ya. El portal puede dejarlo registrado de
+          // dos formas: con un `clientMessageId` (mensaje manual del asesor) o
+          // con un `messageId` ya creado por él (p. ej. el aviso de "Devolver a
+          // Paula", que la API inserta como mensaje del bot). Si cualquiera de
+          // los dos ya existe en `messages`, NO creamos otro (evita el doble en
+          // el portal: uno de la API y otro del worker).
           if (p.content) {
-            const yaExiste = p.clientMessageId
-              ? await prisma.message.findFirst({ where: { clientMessageId: p.clientMessageId } })
-              : null
+            let yaExiste = null as Awaited<ReturnType<typeof prisma.message.findFirst>> | null
+            if (p.messageId) {
+              yaExiste = await prisma.message.findFirst({ where: { messageId: p.messageId } })
+            }
+            if (!yaExiste && p.clientMessageId) {
+              yaExiste = await prisma.message.findFirst({ where: { clientMessageId: p.clientMessageId } })
+            }
             if (!yaExiste) {
               await repo.guardarMensaje({
                 sessionId: p.sessionId,
@@ -67,11 +90,19 @@ export const iniciarWorkerSalientes = (
             }
           }
 
-          await repo.marcarSalienteEnviado(p.id)
+          await repo.marcarSalienteEnviado(p.id, p.messageId)
           log('[outbound] enviado', p.id, '->', p.phoneE164)
         } catch (err) {
-          await repo.marcarSalienteFallido(p.id, String(err))
-          log('[outbound] fallo enviando', p.id, String(err))
+          // marcarSalienteFallido decide reintento (backoff) vs FAILED definitivo
+          // según p.attempts (ya incrementado al reclamar) y MAX_OUTBOUND_ATTEMPTS.
+          await repo.marcarSalienteFallido(p.id, String(err), p.attempts, p.messageId)
+          const definitivo = p.attempts >= repo.MAX_OUTBOUND_ATTEMPTS
+          log(
+            '[outbound]',
+            definitivo ? 'FALLIDO definitivo' : `fallo (intento ${p.attempts}), reintentará`,
+            p.id,
+            String(err),
+          )
         }
       }
     } catch (err) {

@@ -41,5 +41,3 @@ export const aE164 = (numero: string): string => (numero.startsWith('+') ? numer
 
 /** contact_id canónico para WhatsApp: WA#<E164>. */
 export const contactIdDe = (numero: string): string => `WA#${aE164(numero)}`
-
-export default prisma

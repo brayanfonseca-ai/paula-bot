@@ -1,44 +1,42 @@
-<p align="center">
-  <a href="https://builderbot.app/">
-    <picture>
-      <img src="https://builderbot.app/assets/thumbnail-vector.png" height="80">
-    </picture>
-    <h2 align="center">BuilderBot</h2>
-  </a>
-</p>
+# paula-bot
 
+Bot de WhatsApp del sistema **Paula**. Node + TypeScript, framework **BuilderBot** con
+provider de Meta (WhatsApp Cloud API), empaquetado con **rollup** a `dist/app.js`. Corre bajo
+PM2 en el puerto **3009** y comparte la base PostgreSQL `paula` con el portal.
 
+## Qué hace
+Atiende a clientes por WhatsApp: autenticación, consulta de documentos tributarios, entrega
+de PDFs, derivación a un asesor humano (handoff) y modo agente IA. Persiste sesiones,
+mensajes y auditoría en PostgreSQL (vía Prisma) y drena una cola de salida
+(`outbound_messages`) con reintentos.
 
-<p align="center">
-  <a aria-label="NPM version" href="https://www.npmjs.com/package/@builderbot/bot">
-    <img alt="" src="https://img.shields.io/npm/v/@builderbot/bot?color=%2300c200&label=%40bot-whatsapp">
-  </a>
-  <a aria-label="Join the community on GitHub" href="https://link.codigoencasa.com/DISCORD">
-    <img alt="" src="https://img.shields.io/discord/915193197645402142?logo=discord">
-  </a>
-</p>
-
-
-## Getting Started
-
-With this library, you can build automated conversation flows agnostic to the WhatsApp provider, set up automated responses for frequently asked questions, receive and respond to messages automatically, and track interactions with customers. Additionally, you can easily set up triggers to expand functionalities limitlessly.
-
-```
-npm create builderbot@latest
+## Estructura
+```text
+src/
+  app.ts               # punto de entrada (webhook + arranque)
+  config.ts            # lectura de variables de entorno
+  repository.ts        # acceso a datos (Prisma)
+  outbound-worker.ts   # drena la cola de salida y envía por WhatsApp
+  session-watchdog.ts  # cierra sesiones inactivas
+  wa-transport.ts      # envío por teléfono (to) o BSUID/@username (recipient)
+  agente-ia.ts         # integración con el agente IA externo
+  tls-setup.ts         # añade la CA corporativa (import de efecto, PRIMERO en app.ts)
+prisma/schema.prisma   # copia del esquema que consume el bot (derivada del canónico del portal)
 ```
 
+## Desarrollo
+```powershell
+npm install
+npm run build          # rollup -> dist/app.js
+npm run dev            # arranque con --watch
+npm run lint
+```
 
-## Documentation
+## Configuración
+Copia `.env.example` a `.env` y completa las claves de Meta, `DATABASE_URL`, `PORT` y
+`NODE_EXTRA_CA_CERTS`. El `.env` no se versiona.
 
-Visit [builderbot](https://builderbot.app/) to view the full documentation.
-
-
-## Official Course
-
-If you want to discover all the functions and features offered by the library you can take the course.
-[View Course](https://app.codigoencasa.com/courses/builderbot?refCode=LEIFER)
-
-
-## Contact Us
-- [💻 Discord](https://link.codigoencasa.com/DISCORD)
-- [👌 𝕏 (Twitter)](https://twitter.com/leifermendez)
+## Más información
+La documentación del servidor, el despliegue y las buenas prácticas están en
+[`../docs`](../docs/README.md). Para la arquitectura completa, ver
+[`../docs/02-ARQUITECTURA-REFERENCIA-PAULA.md`](../docs/02-ARQUITECTURA-REFERENCIA-PAULA.md).

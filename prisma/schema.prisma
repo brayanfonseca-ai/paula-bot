@@ -1,23 +1,29 @@
 // ============================================================================
-// Copia sincronizada del esquema canónico de Paula.
-// FUENTE DE VERDAD: paula-portal/libs/db/prisma/schema.prisma
-// El bot usa esta copia solo para generar su cliente Prisma; NO ejecuta
-// migraciones (las migraciones viven en el portal). Ambos apuntan a la misma
-// base de datos PostgreSQL 'paula'.
-// Si cambias el esquema, edítalo primero en el portal y copia aquí.
+// ARCHIVO GENERADO — NO EDITAR A MANO.
+// Fuente de verdad: paula-portal/libs/db/prisma/schema.prisma
+// Regenerar con: node scripts/sync-schema.mjs  (o npm run prisma:generate)
+// ============================================================================
+
+// ============================================================================
+// Esquema canónico de la base de datos Paula (PostgreSQL local).
+// Punto de encuentro entre paula-bot (escribe lo que pasa en WhatsApp) y
+// paula-portal (opera las conversaciones). Adaptación relacional del modelo
+// DynamoDB descrito en documentacion/.../data-model.md, alineado con los
+// enums y DTOs de libs/contracts.
+//
+// Este es el esquema FUENTE DE VERDAD. paula-bot usa una copia sincronizada.
 // ============================================================================
 
 generator client {
   provider = "prisma-client-js"
 }
-
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
 // ----------------------------------------------------------------------------
-// Enumeraciones de dominio
+// Enumeraciones de dominio (reflejan libs/contracts/src/enums.ts y data-model)
 // ----------------------------------------------------------------------------
 
 enum Channel {
@@ -102,6 +108,8 @@ enum AuditSource {
   WATCHDOG
 }
 
+// Estado de la cola de salida (mensajes que el portal encola para que el bot
+// los envíe por WhatsApp). El bot hace polling de PENDING.
 enum OutboundStatus {
   PENDING
   SENDING
@@ -113,7 +121,7 @@ enum OutboundStatus {
 // Contactos (identidad del canal). Tabla 3 del data-model.
 // ----------------------------------------------------------------------------
 model Contact {
-  contactId            String    @id @map("contact_id")
+  contactId            String    @id @map("contact_id") // WA#+573001234567
   schemaVersion        Int       @default(1) @map("schema_version")
   channel              Channel   @default(WHATSAPP)
   phoneE164            String    @unique @map("phone_e164")
@@ -122,6 +130,14 @@ model Contact {
   preferredLanguage    String?   @default("es") @map("preferred_language")
   lastSessionId        String?   @map("last_session_id")
   lastSeenAt           DateTime? @map("last_seen_at")
+
+  // Aceptación de la política de tratamiento de datos (una sola vez por
+  // contacto, permanente). Si `policyAcceptedAt` es null, el bot muestra el PDF
+  // y pide aceptar tras autenticar; si tiene fecha, no se vuelve a pedir.
+  // `policyVersion` permite re-solicitar si en el futuro cambia la política.
+  policyAcceptedAt     DateTime? @map("policy_accepted_at")
+  policyVersion        String?   @map("policy_version")
+
   version              Int       @default(1)
   createdAt            DateTime  @default(now()) @map("created_at")
   updatedAt            DateTime  @updatedAt @map("updated_at")
@@ -132,10 +148,11 @@ model Contact {
 }
 
 // ----------------------------------------------------------------------------
-// Usuarios del portal.
+// Usuarios del portal. En AWS vive en Cognito; en local lo persistimos aquí
+// para reemplazar el auth mock. La contraseña se guarda hasheada.
 // ----------------------------------------------------------------------------
 model User {
-  id           String   @id
+  id           String   @id // cognito-sub equivalente
   email        String   @unique
   name         String
   role         UserRole @default(PAULA_ADVISOR)
@@ -154,7 +171,7 @@ model User {
 // Sesiones (estado de la conversación). Tabla 1 del data-model.
 // ----------------------------------------------------------------------------
 model Session {
-  sessionId          String             @id @map("session_id")
+  sessionId          String             @id @map("session_id") // SES#<ulid>
   schemaVersion      Int                @default(1) @map("schema_version")
   channel            Channel            @default(WHATSAPP)
 
@@ -164,13 +181,19 @@ model Session {
   thirdPartyId       String?            @map("third_party_id")
   thirdPartyName     String?            @map("third_party_name")
 
-  flow               String?            @default("MENU")
+  // `flow` es el ESTADO de la maquina de conversacion del bot (fuente de verdad
+  // en BD, no en memoria): NUEVA | MENU_PRINCIPAL | EXTRACTO_ANIO | EXTRACTO_MES |
+  // RETENCION_TIPO | RETENCION_ANIO | AUTENTICACION | AGENTE_IA | ASESOR_HUMANO ...
+  flow               String?            @default("MENU_PRINCIPAL")
+  // Contexto temporal del flujo (propietario/anio/mes/tipoRetencion...). Se
+  // invalida al cerrar la sesion o por inactividad. NO es historial.
+  flowContext        Json?              @map("flow_context")
   mode               ConversationMode   @default(AUTOMATIC)
   status             ConversationStatus @default(CREATED)
 
-  assignedTo         String?            @map("assigned_to")
+  assignedTo         String?            @map("assigned_to")     // user.id
   assignedToName     String?            @map("assigned_to_name")
-  assignmentKey      String             @default("UNASSIGNED") @map("assignment_key")
+  assignmentKey      String             @default("UNASSIGNED") @map("assignment_key") // UNASSIGNED | USER#<id>
 
   lastMessageAt        DateTime?        @map("last_message_at")
   lastUserActivityAt   DateTime?        @map("last_user_activity_at")
@@ -187,6 +210,7 @@ model Session {
   summaryUntilKey     String?           @map("summary_until_key")
   contextVersion      Int               @default(1) @map("context_version")
 
+  // Optimistic concurrency: los comandos usan expectedVersion.
   version            Int                @default(1)
 
   createdAt          DateTime           @default(now()) @map("created_at")
@@ -198,11 +222,12 @@ model Session {
   auditEvents   AuditEvent[]
   readStates    UserReadState[]
   outbound      OutboundMessage[]
+  agentSession  AgentSession?
 
-  @@index([phoneE164, createdAt])
-  @@index([assignmentKey, lastMessageAt])
-  @@index([status, lastUserActivityAt])
-  @@index([thirdPartyId, createdAt])
+  @@index([phoneE164, createdAt])                 // AP-02 última sesión de un teléfono
+  @@index([assignmentKey, lastMessageAt])         // AP-03/04 bandejas por asignación
+  @@index([status, lastUserActivityAt])           // AP-05 watchdog / bandejas por estado
+  @@index([thirdPartyId, createdAt])              // AP-06 sesiones por tercero
   @@map("sessions")
 }
 
@@ -210,12 +235,12 @@ model Session {
 // Mensajes (histórico conversacional). Tabla 2 del data-model.
 // ----------------------------------------------------------------------------
 model Message {
-  messageId          String            @id @map("message_id")
+  messageId          String            @id @map("message_id") // MSG#<ulid>
   sessionId          String            @map("session_id")
   schemaVersion      Int               @default(1) @map("schema_version")
 
-  externalMessageId  String?           @map("external_message_id")
-  clientMessageId    String?           @map("client_message_id")
+  externalMessageId  String?           @map("external_message_id") // wamid.xxx
+  clientMessageId    String?           @map("client_message_id")   // idempotencia web
 
   role               MessageRole
   direction          MessageDirection
@@ -223,7 +248,11 @@ model Message {
   visibility         MessageVisibility @default(PUBLIC)
 
   content            String?
-  attachments        Json?
+  // Texto legible para humanos cuando `content` es un payload tecnico de una
+  // respuesta interactiva (p. ej. content="mes_0" -> displayText="Septiembre").
+  // El frontend muestra displayText si existe; el backend usa content. (BUG-003)
+  displayText        String?           @map("display_text")
+  attachments        Json?             // metadata de adjuntos (binarios fuera de la BD)
 
   authorId           String?           @map("author_id")
   authorName         String?           @map("author_name")
@@ -231,6 +260,13 @@ model Message {
 
   deliveryStatus     DeliveryStatus?   @map("delivery_status")
   deliveryErrorCode  String?           @map("delivery_error_code")
+
+  // Soft-delete de mensajes (FUNC-001). El registro NUNCA se borra fisicamente:
+  // se marca como eliminado conservando el contenido original y la trazabilidad.
+  isDeleted          Boolean           @default(false) @map("is_deleted")
+  deletedAt          DateTime?         @map("deleted_at")
+  deletedBy          String?           @map("deleted_by")
+  deleteReason       String?           @map("delete_reason")
 
   toolName           String?           @map("tool_name")
   toolCallId         String?           @map("tool_call_id")
@@ -243,8 +279,8 @@ model Message {
 
   session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
 
-  @@index([sessionId, createdAt])
-  @@index([externalMessageId])
+  @@index([sessionId, createdAt])          // AP-07 mensajes por sesión (paginado)
+  @@index([externalMessageId])             // AP-08 callback por id de proveedor
   @@index([clientMessageId])
   @@map("messages")
 }
@@ -253,16 +289,16 @@ model Message {
 // Auditoría de dominio. Tabla 4 del data-model.
 // ----------------------------------------------------------------------------
 model AuditEvent {
-  eventId       String         @id @map("event_id")
+  eventId       String         @id @map("event_id") // EVT#<ulid>
   sessionId     String         @map("session_id")
   schemaVersion Int            @default(1) @map("schema_version")
 
-  eventType     String         @map("event_type")
+  eventType     String         @map("event_type")   // SESSION_CREATED, ASSIGNED, ...
   actorType     AuditActorType @map("actor_type")
   actorId       String?        @map("actor_id")
   actorName     String?        @map("actor_name")
 
-  entityType    String         @map("entity_type")
+  entityType    String         @map("entity_type")  // SESSION/MESSAGE/ASSIGNMENT/TOOL
   entityId      String?        @map("entity_id")
 
   previousValue Json?          @map("previous_value")
@@ -277,14 +313,15 @@ model AuditEvent {
 
   session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
 
-  @@index([sessionId, createdAt])
-  @@index([actorId, createdAt])
+  @@index([sessionId, createdAt])   // AP-09 auditoría por sesión
+  @@index([actorId, createdAt])     // AP-10 auditoría por asesor
   @@index([eventType, createdAt])
   @@map("audit_events")
 }
 
 // ----------------------------------------------------------------------------
-// Estado de lectura del portal. Tabla 5 del data-model.
+// Estado de lectura del portal (no leídos). Tabla 5 del data-model.
+// Owner: Web API.
 // ----------------------------------------------------------------------------
 model UserReadState {
   userId                  String   @map("user_id")
@@ -300,7 +337,7 @@ model UserReadState {
   user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
 
-  @@id([userId, sessionId])
+  @@id([userId, sessionId])   // AP-11
   @@map("user_read_state")
 }
 
@@ -308,10 +345,10 @@ model UserReadState {
 // Idempotencia. Tabla 6 del data-model.
 // ----------------------------------------------------------------------------
 model IdempotencyKey {
-  idempotencyKey String   @id @map("idempotency_key")
+  idempotencyKey String   @id @map("idempotency_key") // INBOUND#<ext> | COMMAND#<id> ...
   schemaVersion  Int      @default(1) @map("schema_version")
-  scope          String
-  status         String   @default("PROCESSING")
+  scope          String                                 // INBOUND_MESSAGE/WEB_COMMAND/TOOL_CALL/OUTBOUND_MESSAGE
+  status         String   @default("PROCESSING")        // PROCESSING/COMPLETED/FAILED
   sessionId      String?  @map("session_id")
   entityId       String?  @map("entity_id")
   requestHash    String?  @map("request_hash")
@@ -324,31 +361,131 @@ model IdempotencyKey {
 }
 
 // ----------------------------------------------------------------------------
-// Cola de salida: portal -> bot.
+// Cola de salida: mensajes que el PORTAL encola para que el BOT los envíe por
+// WhatsApp (modo MANUAL / asesor). El bot hace polling de los PENDING, los
+// envía por la Graph API y marca SENT/FAILED. Este es el canal portal -> bot.
 // ----------------------------------------------------------------------------
 model OutboundMessage {
   id              String         @id @default(uuid())
   sessionId       String         @map("session_id")
   phoneE164       String         @map("phone_e164")
 
+  // Referencia al mensaje ya persistido en `messages` (para reconciliar entrega).
   messageId       String?        @map("message_id")
   clientMessageId String?        @map("client_message_id")
 
-  kind            String         @default("text")
-  content         String?
-  mediaUrl        String?        @map("media_url")
+  kind            String         @default("text")   // text | image | document
+  content         String?                            // texto o caption
+  mediaUrl        String?        @map("media_url")   // link para imagen/documento
   filename        String?
 
   status          OutboundStatus @default(PENDING)
   attempts        Int            @default(0)
   lastError       String?        @map("last_error")
+  // Momento a partir del cual el mensaje es elegible para (re)envio. Permite
+  // backoff exponencial ante fallos: al fallar se reprograma hacia el futuro.
+  // Los PENDING nuevos lo tienen null (=> elegibles de inmediato). WS-05.
+  nextAttemptAt   DateTime?      @map("next_attempt_at")
 
-  enqueuedBy      String?        @map("enqueued_by")
+  enqueuedBy      String?        @map("enqueued_by") // user.id del asesor
   createdAt       DateTime       @default(now()) @map("created_at")
   sentAt          DateTime?      @map("sent_at")
 
   session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
 
-  @@index([status, createdAt])
+  @@index([status, createdAt])         // polling del bot: PENDING ordenados
+  @@index([status, nextAttemptAt])     // WS-05: elegibilidad por reintento programado
   @@map("outbound_messages")
+}
+
+// ----------------------------------------------------------------------------
+// Reportes pendientes (WS-08): PDFs que PhariTech genera de forma asíncrona.
+// El bot crea el reporte, obtiene un id y debe seguir haciendo polling hasta
+// que el documento esté listo para entregarlo por WhatsApp. Antes esto vivía
+// en `logs/pendientes.json` (frágil: se pierde entre despliegues/instancias y
+// no es transaccional). Ahora se persiste aquí para sobrevivir reinicios y ser
+// la fuente única. El bot recupera los PENDING al arrancar y reanuda el polling.
+// ----------------------------------------------------------------------------
+model PendingReport {
+  // id del reporte devuelto por PhariTech (identidad natural, evita duplicados).
+  reportId     String   @id @map("report_id")
+  phoneE164    String    @map("phone_e164")
+  // 'extracto' | 'ica' | 'fuente' (etiqueta de dominio para trazas/mensajes).
+  label        String
+  filename     String
+  caption      String
+  successText  String    @map("success_text")
+
+  attempts     Int       @default(0)
+  lastError    String?   @map("last_error")
+
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([createdAt])   // recuperación ordenada al arrancar
+  @@map("pending_reports")
+}
+
+// ----------------------------------------------------------------------------
+// Sesiones del agente IA (Bedrock AgentCore vía la API orquestadora).
+// Relaciona 1:1 una conversación de Paula con el `sessionId` que mantiene la
+// memoria del agente en AWS. El hilo del agente CADUCA a los ~10 min (alineado
+// con el watchdog de inactividad de Paula): pasado `expiresAt`, el vínculo se
+// considera vencido y el siguiente turno arranca un hilo nuevo (sin reenviar el
+// bedrockSessionId viejo). Al cerrar la conversación el vínculo se borra en
+// cascada. `actorId` (teléfono) permite memoria por persona en el agente.
+// ----------------------------------------------------------------------------
+model AgentSession {
+  // 1:1 con la conversación: la PK es el propio session_id de Paula.
+  sessionId        String   @id @map("session_id")
+  // sessionId que devuelve la API del agente (>= 33 chars). Null hasta el 1er turno.
+  bedrockSessionId String?  @map("bedrock_session_id")
+  // Identificador del usuario final para la memoria del agente (teléfono E.164).
+  actorId          String?  @map("actor_id")
+  // Última actividad y vencimiento del hilo IA (para expirar a los ~10 min).
+  lastActivityAt   DateTime @default(now()) @map("last_activity_at")
+  expiresAt        DateTime @map("expires_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([expiresAt])   // barrido de vínculos vencidos
+  @@map("agent_sessions")
+}
+
+// ----------------------------------------------------------------------------
+// Directorio de teléfonos (soporte al esquema de usernames/BSUID de Meta).
+// A partir de 2026 Meta puede entregar mensajes SIN el teléfono del usuario:
+// el remitente llega como BSUID (`user_id`) y el nombre público como @username
+// (contacts[].profile.username). Como el bot necesita el TELÉFONO para la
+// autenticación (owner/PhariTech), aquí se mapea manualmente @username -> teléfono
+// + NIT. Un humano (asesor/supervisor/admin) administra este directorio desde el
+// portal. Si el usuario cambia su @ en WhatsApp, se actualiza aquí a mano; por eso
+// también guardamos el `bsuid` (identificador estable que NO cambia) para
+// re-vincular automáticamente cuando sea posible.
+// ----------------------------------------------------------------------------
+model PhoneDirectory {
+  id          String   @id @default(uuid())
+  // Teléfono en E.164 (clave para el owner/PhariTech). Único. Puede estar
+  // vacío en entradas AUTO-creadas por el bot (pendientes de que un asesor
+  // complete el teléfono): el @username/BSUID ya quedan registrados.
+  phoneE164   String?  @unique @map("phone_e164")
+  // NIT del propietario (identificación del usuario).
+  nit         String?
+  // @username público de WhatsApp (lo que el usuario comparte). Único, en
+  // mayúsculas tal como lo entrega Meta (p. ej. "IVANCHO97"). Editable.
+  username    String   @unique
+  // BSUID (business-scoped user id) estable que Meta asigna; no cambia aunque el
+  // usuario cambie su @. Permite re-vincular automáticamente. Único si está.
+  bsuid       String?  @unique
+  // Nombre de perfil (para que el asesor identifique a la persona).
+  displayName String?  @map("display_name")
+  // user.id del portal que creó/editó el registro (auditoría ligera).
+  createdBy   String?  @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([nit])
+  @@map("phone_directory")
 }

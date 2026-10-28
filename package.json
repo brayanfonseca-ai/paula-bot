@@ -9,8 +9,11 @@
     "lint": "eslint . --no-ignore",
     "dev": "npm run lint && nodemon --signal SIGKILL  ./src/app.ts",
     "build": "npx rollup -c",
-    "prisma:generate": "prisma generate",
-    "postinstall": "prisma generate"
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "schema:sync": "node scripts/sync-schema.mjs",
+    "schema:check": "node scripts/sync-schema.mjs --check",
+    "prisma:generate": "node scripts/sync-schema.mjs && prisma generate",
+    "postinstall": "node scripts/sync-schema.mjs && prisma generate"
   },
   "keywords": [],
   "dependencies": {
